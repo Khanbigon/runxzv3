@@ -79,6 +79,26 @@ def similarity_search(query_text, n_results=5):
     except Exception as e:
         print(f"相似度搜索失败: {e}")
         return None
+def batch_add_resumes(resumes_datas):
+    """批量添加简历信息
+    Args:
+        resumes_datas: 简历数据列表
+        格式: [{"name": str, "index": str, "resume_content": str}, ...]
+    Returns:
+        int: 成功添加的简历数量
+    """
+    success_count = 0
+    # 直接遍历列表
+    for resume in resumes_datas:
+        # 转换字段名称以匹配 add_resume 函数的要求
+        formatted_resume = {
+            "name": resume.get("name", ""),
+            "stu_ids": resume.get("index", ""),  # 从 index 字段获取学号
+            "resume_content": resume.get("resume_content", "")
+        }
+        if add_resume(formatted_resume):
+            success_count += 1
+    return success_count
 
 if __name__ == "__main__":
     # 测试添加
