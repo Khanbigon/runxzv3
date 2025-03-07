@@ -10,6 +10,8 @@ from uuid import uuid4
 from job_chromadb_operater import query_job, add_job, delete_job, similarity_search as job_similarity_search
 from resume_chromadb_operater import query_resume, add_resume, delete_resume, similarity_search as resume_similarity_search
 import os
+import hashlib
+import requests
 # 大模型配置
 client = OpenAI(
     api_key="sk-430766cb68934151aaeae540823fea2f",
@@ -86,7 +88,7 @@ def auto_update_task():
 update_thread = threading.Thread(target=auto_update_task, daemon=True)
 update_thread.start()
 
-def process_resume_form(name, student_id, education, major, skills, projects, internships):
+def process_resume_form(name, student_id, mobile, education, major, skills, projects, internships):
     if not name or not student_id:
         return "请填写姓名和学号", None
     
@@ -94,12 +96,19 @@ def process_resume_form(name, student_id, education, major, skills, projects, in
     resume_data = {
         "name": name,
         "index": student_id,
+        "mobile": mobile,
+        "metadata": {  # 添加元数据字段
+        "student_id": student_id,
+        "mobile": mobile,
+        "source": "form"
+    },
         "resume_content": f"""
 教育背景：{education}
 专业：{major}
 技能：{skills}
 项目经历：{projects}
 实习经历：{internships}
+手机号：{mobile}
         """
     }
     
@@ -114,6 +123,7 @@ def process_resume_form(name, student_id, education, major, skills, projects, in
         return f"简历信息已保存", temp_file
     except Exception as e:
         return f"简历保存失败: {str(e)}", temp_file
+
 
 # 批量匹配处理
 def batch_match_process(resume_file, job_file=None, top_n=3):
@@ -147,6 +157,7 @@ def batch_match_process(resume_file, job_file=None, top_n=3):
     for idx, student in enumerate(resumes):
         student_name = student.get('name', f'学生{idx+1}')
         student_id = student.get('index', '')
+        student_mobile = student.get('mobile', '')
         student_resume = student.get('resume_content', '')
         
         progress(0.3 + 0.6 * (idx/total_students), desc=f"({idx+1}/{total_students})...")
@@ -183,6 +194,7 @@ def batch_match_process(resume_file, job_file=None, top_n=3):
         all_matches.append({
             "name": student_name,
             "stu_id": student_id,
+            "mobile": student_mobile,
             "resume_content": student_resume,
             "matched_jobs": top_matches
         })
@@ -206,6 +218,267 @@ def manual_update():
         value=f"最后更新：{last_update_time}" if success else "更新失败！",
         visible=True
     )
+
+def get_student_mobile(student_id):
+    """
+    根据学号获取学生手机号
+    从学生简历中提取手机号
+    
+    参数:
+    student_id: 学生学号
+    
+    返回:
+    str: 学生手机号
+    """
+    try:
+        # 1. 优先从向量数据库查询
+        from resume_chromadb_operater import query_resume
+        resume_data = query_resume(student_id)
+        if resume_data and resume_data.get("metadata", {}).get("mobile"):
+            return resume_data["metadata"]["mobile"]
+
+        # 2. 尝试从匹配结果文件中查询
+        for file in os.listdir():
+            if file.startswith("match_result_") and file.endswith(".json"):
+                with open(file, 'r', encoding='utf-8') as f:
+                    match_results = json.load(f)
+                    for student in match_results:
+                        if student.get('stu_id') == student_id:
+                            # 如果匹配结果中有手机号字段
+                            if 'mobile' in student and student['mobile']:
+                                return student['mobile']
+        
+        # 2. 尝试从临时文件中查询
+        temp_file = f"temp_resume_{student_id}.json"
+        if os.path.exists(temp_file):
+            with open(temp_file, 'r', encoding='utf-8') as f:
+                resume_data = json.load(f)
+                if 'mobile' in resume_data and resume_data['mobile']:
+                    return resume_data['mobile']
+        
+        # 3. 尝试从向量数据库中查询
+        try:
+            from resume_chromadb_operater import query_resume
+            resume_data = query_resume(student_id)
+            if resume_data and 'mobile' in resume_data and resume_data['mobile']:
+                return resume_data['mobile']
+        except Exception as e:
+            print(f"从向量数据库查询手机号失败: {str(e)}")
+        
+        # 4. 从简历内容中提取手机号
+        # 尝试从临时文件中的简历内容提取
+        if os.path.exists(temp_file):
+            with open(temp_file, 'r', encoding='utf-8') as f:
+                resume_data = json.load(f)
+                content = resume_data.get('resume_content', '')
+                # 使用正则表达式匹配手机号
+                mobile_match = re.search(r'1[3-9]\d{9}', content)
+                if mobile_match:
+                    return mobile_match.group(0)
+        
+        # 5. 如果以上方法都失败，返回默认手机号
+        print(f"未能找到学号 {student_id} 的手机号，使用默认号码")
+        return "13723728369"  # 默认手机号
+    except Exception as e:
+        print(f"获取手机号时出错: {str(e)}")
+        return "13723728369"  # 出错时返回默认手机号
+
+# 短信发送函数
+def send_sms(mobile, content, sign="深圳技术大学"):
+    """发送短信的函数
+    
+    Args:
+        mobile: 接收短信的手机号
+        content: 短信内容 (不含签名)
+        sign: 短信签名
+    
+    Returns:
+        dict: 包含发送状态和消息的字典
+    """
+    try:
+        # 验证手机号格式
+        if not mobile or not re.match(r'^1[3-9]\d{9}$', str(mobile)):
+            return {"success": False, "message": f"无效的手机号: {mobile}"}
+        # 目标接口URL和参数
+        password = "92053811"
+        post_url = "http://10.1.12.218:8088/websms/smsJsonService"
+        md5 = hashlib.md5(password.encode('utf-8')).hexdigest()
+        
+        # 构建完整短信内容
+        full_content = f"【{sign}】{content}"
+        
+        post_data = {
+            "action": "sendsms",
+            "userId": "xsjyzdzx",  # 企业帐号
+            "md5password": md5,  # 企业密码
+            "content": full_content,
+            "mobile": str(mobile),
+        }
+        print(f"发送短信请求: {post_data}")
+        response = requests.post(post_url, data=post_data)
+        result = response.text
+        print(f"短信发送响应: {result}")
+        
+        # 检查响应是否包含成功信息
+        if "success" in result.lower() or "成功" in result:
+            return {"success": True, "message": "短信发送成功", "response": result}
+        else:
+            return {"success": False, "message": f"短信发送失败: {result}", "response": result}
+    except Exception as e:
+        print(f"短信发送失败: {str(e)}")
+        return {"success": False, "message": f"短信发送失败: {str(e)}"}
+
+# 个人匹配后发送通知
+def send_match_notification(student_id=None, current_id=None, result_data=None):
+    """发送个人匹配结果通知
+    
+    Args:
+        result_data: 匹配结果数据
+        student_id: 学生学号(用于在数据库中查找)
+    
+    Returns:
+        str: 操作结果信息
+    """
+    # 如果没有直接提供结果数据，尝试通过学号查找
+    actual_id = student_id if student_id else current_id
+    try:
+        # 检查是否提供了学号
+        if not actual_id:
+            return "请先填写学号或上传简历"
+            
+        print(f"尝试为学号 {student_id} 发送通知")
+        
+        # 获取学生手机号
+        mobile = get_student_mobile(actual_id)
+        
+        if not mobile or mobile == "13723728369":  # 检查是否为默认手机号
+            return "未找到有效的手机号码，请确保已填写手机号"
+            
+        print(f"获取到手机号: {mobile}")
+        
+        # 构建短信内容
+        sms_content = f"您好，您的求职简历已匹配到合适岗位，请登录就业系统查看详情。"
+        
+        # 发送短信
+        result = send_sms(mobile, sms_content)
+        
+        if result["success"]:
+            return f"<div style='color:green'>匹配结果通知已发送至 {mobile}</div>"
+        else:
+            return f"<div style='color:red'>发送失败: {result['message']}</div>"
+    except Exception as e:
+        print(f"发送通知时出错: {str(e)}")
+        return f"<div style='color:red'>发送通知时出错: {str(e)}</div>"
+
+# 批量发送匹配结果通知
+def batch_send_notifications(result_file):
+    """批量发送匹配结果通知
+    
+    Args:
+        result_file: 匹配结果文件路径
+    
+    Returns:
+        str: 包含发送统计信息的HTML
+    """
+    progress = gr.Progress()
+    
+    # 加载匹配结果文件
+    try:
+        progress(0.1, desc="读取匹配结果...")
+        with open(result_file.name, 'r', encoding='utf-8') as f:
+            match_results = json.load(f)
+    except Exception as e:
+        return f"<div style='color:red'>读取匹配结果文件失败: {str(e)}</div>"
+    
+    total = len(match_results)
+    success_count = 0
+    failed_count = 0
+    failed_students = []
+    
+    progress(0.2, desc="准备发送通知...")
+    
+    # 遍历每个学生的匹配结果发送通知
+    for i, student in enumerate(match_results):
+        progress(0.2 + 0.7 * (i/total), desc=f"正在发送 ({i+1}/{total})...")
+        student_name = student.get('name', '未知学生')
+        student_id = student.get('stu_id', '')
+        mobile = student.get('mobile', '')
+        if not mobile:
+            mobile = get_student_mobile(student_id)
+        
+        if not mobile:
+            failed_count += 1
+            failed_students.append({"name": student_name, "id": student_id, "error": "未找到手机号"})
+            continue
+        
+        # 获取学生的匹配结果
+        if student.get('matched_jobs'):
+            top_job = student['matched_jobs'][0]
+            company = top_job.get('company_name', '未知企业')
+            score = top_job.get('score', 0)
+            
+            # 构建短信内容
+            sms_content = f"您好，您的求职简历已匹配到合适岗位(匹配度:{score}%)，最佳匹配为{company}，请登录就业系统查看详情。"
+            
+            # 发送短信
+            result = send_sms(mobile, sms_content)
+            
+            if result["success"]:
+                success_count += 1
+            else:
+                failed_count += 1
+                failed_students.append({"name": student_name, "id": student_id, "error": result["message"]})
+        else:
+            failed_count += 1
+            failed_students.append({"name": student_name, "id": student_id, "error": "无匹配结果"})
+    
+    progress(1.0, desc="发送完成！")
+    
+    # 生成发送报告
+    html = f"""
+    <div style="font-family: 'Segoe UI', sans-serif; max-width: 800px; margin: 20px auto;">
+        <h3 style="color: #003788;">短信通知发送报告</h3>
+        <div style="background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; 
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <p><strong>总计:</strong> {total}条</p>
+            <p><strong>成功:</strong> <span style="color:green">{success_count}条</span></p>
+            <p><strong>失败:</strong> <span style="color:red">{failed_count}条</span></p>
+        </div>
+    """
+    
+    if failed_students:
+        html += """
+        <div style="background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; 
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            <h4 style="color: #e74c3c;">发送失败列表</h4>
+            <table style="width: 100%; border-collapse: collapse; margin-top: 15px;">
+                <thead>
+                    <tr style="background-color: #f2f6fc;">
+                        <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">姓名</th>
+                        <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">学号</th>
+                        <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">错误信息</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+        
+        for student in failed_students:
+            html += f"""
+                <tr>
+                    <td style="padding: 10px; border-bottom: 1px solid #eee;">{student['name']}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #eee;">{student['id']}</td>
+                    <td style="padding: 10px; border-bottom: 1px solid #eee;">{student['error']}</td>
+                </tr>
+            """
+        
+        html += """
+                </tbody>
+            </table>
+        </div>
+        """
+    
+    html += "</div>"
+    return html
 
 # 批量结果展示HTML生成
 def build_batch_results_html(results):
@@ -280,18 +553,20 @@ def single_match_process(resume_file, job_file=None, min_salary=0, major_filter=
     try:
         # 检查是否有简历文件
         if resume_file is None:
-            return "请先上传简历或填写简历表单"
+            return "请先上传简历或填写简历表单", None
         
         print(f"处理简历文件: {resume_file}, 类型: {type(resume_file)}")
             
         # 检查是否是表单生成的文件路径
+        student_id = ""
         if isinstance(resume_file, str):
             with open(resume_file, 'r', encoding='utf-8') as f:
                 resume_data = json.load(f)
+                student_id = resume_data.get('index', '')
         else:
             with open(resume_file.name, 'r', encoding='utf-8') as f:
                 resume_data = json.load(f)
-                
+                student_id = resume_data.get('index', '')
         # 如果是简历集合，取第一个学生的简历
         if isinstance(resume_data, list) and len(resume_data) > 0:
             resume = resume_data[0]
@@ -379,7 +654,7 @@ def single_match_process(resume_file, job_file=None, min_salary=0, major_filter=
     sorted_results = sorted(results, key=lambda x: x['匹配度'], reverse=True)
     
     # 只返回前3个最佳匹配
-    return build_html_result(sorted_results[:3])
+    return build_html_result(sorted_results[:3]),student_id
 
 # 结果展示HTML生成
 def build_html_result(results):
@@ -629,6 +904,7 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
                             with gr.Accordion("简历信息", open=False):
                                 name_input = gr.Textbox(label="姓名")
                                 resume_student_id_input = gr.Textbox(label="学号")
+                                mobile_input = gr.Textbox(label="手机号")
                                 education_input = gr.Textbox(label="教育背景", placeholder="例如：深圳技术大学，本科，2020-2024")
                                 major_input = gr.Textbox(label="专业", placeholder="例如：计算机科学与技术")
                                 skills_input = gr.Textbox(label="技能", placeholder="例如：Python, Java, 数据分析...", lines=3)
@@ -644,11 +920,7 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
                     
                     company_upload = gr.File(label="上传企业数据（JSON）", file_types=[".json"])
                     
-                    # 添加学号查询功能
-                    gr.Markdown("### 按学号查询匹配结果")
-                    with gr.Row():
-                        student_id_input = gr.Textbox(label="输入学号")
-                        query_student_btn = gr.Button("查询", variant="secondary")
+                    current_student_id = gr.State("")
                     
                     with gr.Row():
                         update_status = gr.Textbox(
@@ -672,9 +944,12 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
                     
                     gr.Markdown("### 🛠 操作面板")
                     with gr.Row():
-                        gr.Button("保存结果", variant="secondary")
-                        gr.Button("发送通知", variant="secondary")
-                        gr.Button("重新匹配", variant="secondary")
+                        save_btn = gr.Button("保存结果", variant="secondary")
+                        send_notification_btn = gr.Button("发送通知", variant="secondary")
+                        rematch_btn = gr.Button("重新匹配", variant="secondary")
+
+                    # 添加短信发送结果显示区域
+                    sms_result = gr.HTML(label="短信发送结果", visible=False)
         
         # 批量匹配页面
         with gr.Tab("批量匹配（就业中心）"):
@@ -708,12 +983,15 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
                     gr.Markdown("### 🛠 操作面板")
                     with gr.Row():
                         batch_export_btn = gr.Button("导出Excel", variant="secondary")
-                        batch_email_btn = gr.Button("批量发送邮件", variant="secondary")
-    # 个人匹配事件绑定
+                        batch_email_btn = gr.Button("批量发送短信", variant="secondary")
 
+                    # 添加批量短信发送结果显示区域  
+                    batch_sms_result = gr.HTML(label="批量短信发送结果", visible=False)
+
+    # 个人匹配事件绑定
     submit_form_btn.click(
         fn=process_resume_form,
-        inputs=[name_input, resume_student_id_input, education_input, major_input, skills_input, projects_input, internships_input],
+        inputs=[name_input, resume_student_id_input, mobile_input, education_input, major_input, skills_input, projects_input, internships_input],
         outputs=[form_status, form_file]
     )
 
@@ -726,12 +1004,21 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
                 major_fil
             ),
         inputs=[resume_upload, form_file, company_upload, min_salary, major_filter],
-        outputs=result_html    
+        outputs=[result_html, current_student_id]     
     )
 
     manual_update_btn.click(
         fn=manual_update,
         outputs=update_status
+    )
+    # 添加发送通知按钮事件绑定
+    send_notification_btn.click(
+        fn=send_match_notification,
+        inputs=[resume_student_id_input, current_student_id],
+        outputs=sms_result
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        outputs=sms_result
     )
     # 批量匹配事件绑定
     batch_start_btn.click(
@@ -743,6 +1030,13 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
         fn=manual_update,
         outputs=batch_update_status
     )
+    # 添加批量发送邮件按钮事件绑定
+    batch_email_btn.click(
+        fn=batch_send_notifications,
+        inputs=[result_file],
+        outputs=batch_sms_result
+    )
+
 # 初始化数据
 fetch_data()
 # 启动应用
