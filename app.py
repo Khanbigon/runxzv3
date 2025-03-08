@@ -125,6 +125,135 @@ def process_resume_form(name, student_id, mobile, education, major, skills, proj
         return f"简历保存失败: {str(e)}", temp_file
 
 
+RESUME_PROMPT = """请根据以下简历内容，提供专业优化建议。分析重点包括：
+1. 结构完整性（基本信息、教育背景、技能、项目经历等）
+2. 关键词使用与目标岗位的匹配度
+3. 内容量化成果和具体案例
+4. 语言表达的专业性和简洁性
+5. 格式规范性和易读性
+
+简历内容：
+{resume_content}
+
+请按以下JSON格式返回分析结果：
+{{
+  "score": 总体评分(0-100),
+  "strengths": ["优势1", "优势2"],
+  "improvements": ["建议1", "建议2", "建议3"]
+}}"""
+
+def get_resume_feedback(resume_content):
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{
+                "role": "user",
+                "content": RESUME_PROMPT.format(resume_content=resume_content)
+            }],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except Exception as e:
+        return {
+            "score": 0,
+            "strengths": [],
+            "improvements": [f"分析失败：{str(e)}"]
+        }
+
+def get_resume_content(resume_file, form_file):
+    try:
+        content = None
+        # 优先使用表单生成的简历文件
+        if form_file and os.path.exists(form_file):
+            with open(form_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                content = data.get('resume_content', '')
+        
+        # 其次使用上传的简历文件
+        if not content and resume_file:
+            if isinstance(resume_file, str):  # 处理文件路径
+                with open(resume_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:  # 处理上传文件对象
+                with open(resume_file.name, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            content = data.get('resume_content', '')
+            
+        if not content:
+            return "请先填写或上传简历"
+            
+        return content
+    except json.JSONDecodeError:
+        return "简历文件格式错误"
+    except Exception as e:
+        print(f"简历内容提取失败: {str(e)}")
+        return "简历解析失败，请检查文件格式"
+
+
+def format_feedback_html(result):
+
+    if not isinstance(result, dict):
+        return f"<div style='color:red'>无效的返回格式：{type(result)}</div>"
+
+    loading_html = """
+    <div style="text-align:center; padding:20px;">
+        <div class="loader"></div>
+        <p style="color:#666;">正在生成优化建议...</p>
+    </div>
+    <style>
+    .loader {
+        border: 5px solid #f3f3f3;
+        border-radius: 50%;
+        border-top: 5px solid #3498db;
+        width: 50px;
+        height: 50px;
+        animation: spin 1s linear infinite;
+        margin: 0 auto;
+    }
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    </style>
+    """
+    
+    # 错误处理
+    if "improvements" not in result:
+        return f"""<div style="color:red; padding:20px;">
+            <h4>⚠️ 分析失败</h4>
+            <p>{result.get('error', '未知错误')}</p>
+        </div>"""
+
+    # 正常处理
+    html = f"""
+    <div style="font-family: 'Segoe UI'; padding: 20px; background: #f8f9fa; border-radius: 10px;">
+        <div style="display: flex; align-items: center; margin-bottom: 20px;">
+            <h3 style="margin: 0; color: #003788;">简历综合评分：</h3>
+            <div style="margin-left: 15px; width: 60px; height: 60px; background: {get_score_color(result['score'])};
+                     border-radius: 50%; display: flex; align-items: center; justify-content: center;">
+                <span style="color: white; font-weight: bold; font-size: 18px;">{result['score']}</span>
+            </div>
+        </div>
+         
+        <div style="background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
+            <h4 style="color: #27ae60; margin-top: 0;">✓ 简历优势</h4>
+            <ul style="color: #2c3e50;">
+                {"".join([f"<li>{s}</li>" for s in result['strengths']])}
+            </ul>
+        </div>
+        
+        <div style="background: white; padding: 20px; border-radius: 10px;">
+            <h4 style="color: #e74c3c; margin-top: 0;">✎ 优化建议</h4>
+            <ol style="color: #2c3e50;">
+                {"".join([f"<li>{i}</li>" for i in result['improvements']])}
+            </ol>
+        </div>
+    </div>
+    """
+    return html
+
 # 批量匹配处理
 def batch_match_process(resume_file, job_file=None, top_n=3):
     global job_data
@@ -188,7 +317,7 @@ def batch_match_process(resume_file, job_file=None, top_n=3):
             })
             
         # 对该学生的匹配结果排序，选择最佳的top_n个
-        student_matches.sort(key=lambda x: x['score'])
+        student_matches.sort(key=lambda x: x['score'], reverse=True)
         top_matches = student_matches[:top_n]
         
         all_matches.append({
@@ -413,13 +542,25 @@ def batch_send_notifications(result_file):
         
         # 获取学生的匹配结果
         if student.get('matched_jobs'):
-            top_job = student['matched_jobs'][0]
-            company = top_job.get('company_name', '未知企业')
-            score = top_job.get('score', 0)
+            top_jobs = student['matched_jobs'][:3]  # 取前3个匹配岗位
+            current_date = datetime.now().strftime("%Y{}%m{}%d{}".format("年", "月", "日"))
+            
+            # 构建岗位链接列表
+            job_links = []
+            for idx, job in enumerate(top_jobs, 1):
+                job_url = job.get('job_url', '').replace('\\', '/')
+                job_links.append(f"岗位{idx}：{job_url}" if job_url else f"岗位{idx}：暂无链接")
             
             # 构建短信内容
-            sms_content = f"您好，您的求职简历已匹配到合适岗位(匹配度:{score}%)，最佳匹配为{company}，请登录就业系统查看详情。"
-            
+            sms_content = f"""亲爱的毕业生同学：
+ 您好！为帮助大家提高应聘成功率，精准瞄准应聘岗位，学校根据同学们在就业信息网填写的简历，与企业岗位需求进行精准匹配，已为您筛选出{len(top_jobs)}个适配度高的岗位。点击下方链接，即可查看岗位详情：
+{chr(10).join(job_links)}
+
+这些推荐岗位会随您简历完善、内容更新及新岗位发布而变化。建议您定期查收短信或关注学校就业信息网、“深技大就业”公众号、学院通知等相关通知，以免错过合适机会。
+
+深圳技术大学学生就业指导中心
+{current_date}"""
+
             # 发送短信
             result = send_sms(mobile, sms_content)
             
@@ -477,6 +618,21 @@ def batch_send_notifications(result_file):
         </div>
         """
     
+    # 添加弹窗脚本
+    html += f"""
+    </div>
+    <script>
+        // 使用模板字符串传递统计信息
+        const msg = `批量发送完成！\\n成功：{success_count}条 | 失败：{failed_count}条`;
+        
+        // 成功时显示绿色弹窗
+        {"alert(`${msg}`);" if success_count > 0 else ""}
+        
+        // 失败时显示红色提示
+        {"alert(`${msg}`);" if failed_count > 0 else ""}
+    </script>
+    """
+
     html += "</div>"
     return html
 
@@ -651,7 +807,7 @@ def single_match_process(resume_file, job_file=None, min_salary=0, major_filter=
     progress(1.0, desc="完成分析！")
     
     # 确保基于匹配度而非distance进行排序
-    sorted_results = sorted(results, key=lambda x: x['匹配度'], reverse=True)
+    sorted_results = sorted(results, key=lambda x: x['匹配度'])
     
     # 只返回前3个最佳匹配
     return build_html_result(sorted_results[:3]),student_id
@@ -686,6 +842,28 @@ def build_html_result(results):
             </div>
         </div>"""
     return html + "</div>"
+
+def get_resume_optimization(resume_file, form_file, progress=gr.Progress()):
+    progress(0.1, desc="正在解析简历内容...")
+    try:
+        # 获取简历内容
+        content = get_resume_content(resume_file, form_file)
+        if isinstance(content, dict):  # 处理直接传入的简历数据
+            content = content.get('resume_content', '')
+        
+        progress(0.3, desc="正在调用大模型分析...")
+        # 调用大模型获取建议
+        feedback = get_resume_feedback(content)
+        
+        progress(0.8, desc="正在格式化结果...")
+        # 转换为HTML
+        html = format_feedback_html(feedback)
+        
+        progress(1.0)
+        return html
+    except Exception as e:
+        print(f"优化建议生成失败: {str(e)}")
+        return f"<div style='color:red'>生成失败：{str(e)}</div>"
 
 # 添加数据库查看功能
 def list_database_content():
@@ -937,19 +1115,29 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
                         major_filter = gr.Dropdown(["不限", "计算机", "电子", "机械", "自动化"], label="专业要求", value="不限")
                     
                     start_btn = gr.Button("开始智能匹配", variant="primary")
+                    
                 
                 with gr.Column(scale=2):
                     gr.Markdown("### 实时匹配结果")
                     result_html = gr.HTML(label="匹配结果")
+
+                    match_progress = gr.HTML(visible=True)
+
+                    gr.Markdown("### 简历优化建议")
+                    feedback_html = gr.HTML(label="优化建议")
+
+                    optimize_progress = gr.HTML(visible=True)
                     
+                    feedback_html = gr.HTML(label="优化建议", visible=True) 
+
                     gr.Markdown("### 🛠 操作面板")
                     with gr.Row():
                         save_btn = gr.Button("保存结果", variant="secondary")
                         send_notification_btn = gr.Button("发送通知", variant="secondary")
-                        rematch_btn = gr.Button("重新匹配", variant="secondary")
+                        optimize_btn = gr.Button("生成优化建议", variant="secondary")
 
                     # 添加短信发送结果显示区域
-                    sms_result = gr.HTML(label="短信发送结果", visible=False)
+                    sms_result = gr.HTML(label="短信发送结果", visible=True)
         
         # 批量匹配页面
         with gr.Tab("批量匹配（就业中心）"):
@@ -986,7 +1174,11 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
                         batch_email_btn = gr.Button("批量发送短信", variant="secondary")
 
                     # 添加批量短信发送结果显示区域  
-                    batch_sms_result = gr.HTML(label="批量短信发送结果", visible=False)
+                    batch_sms_result = gr.HTML(
+    label="批量短信发送结果",
+    visible=False,
+    elem_id="batch_sms_result"  # 添加ID便于定位
+)
 
     # 个人匹配事件绑定
     submit_form_btn.click(
@@ -996,6 +1188,10 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
     )
 
     start_btn.click(
+        fn=lambda: [gr.update(visible=False), gr.update(visible=True)],  # 隐藏优化建议，显示进度条
+        outputs=[feedback_html, match_progress],
+        queue=False
+    ).then(
         fn=lambda resume_file, form_file, company_file, min_sal, major_fil: 
             single_match_process(
                 form_file if form_file else resume_file, 
@@ -1005,6 +1201,10 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
             ),
         inputs=[resume_upload, form_file, company_upload, min_salary, major_filter],
         outputs=[result_html, current_student_id]     
+    ).then(
+        fn=lambda: [gr.update(visible=True), gr.update(visible=False)],  # 恢复显示
+        outputs=[feedback_html, match_progress],
+        queue=False
     )
 
     manual_update_btn.click(
@@ -1037,6 +1237,59 @@ with gr.Blocks(theme=gr.themes.Base(), title="润小职Agent") as demo:
         outputs=batch_sms_result
     )
 
+    optimize_btn.click(
+        fn=lambda: [gr.update(visible=False), gr.update(visible=True)],  # 隐藏匹配结果，显示进度条
+        outputs=[result_html, optimize_progress],
+        queue=False
+    ).then(
+        fn=get_resume_optimization,
+        inputs=[resume_upload, form_file],
+        outputs=feedback_html,
+    ).then(
+        fn=lambda: [gr.update(visible=True), gr.update(visible=False)],  # 恢复显示
+        outputs=[result_html, optimize_progress],
+        queue=False
+    )
+
+match_progress = gr.HTML("""
+<div style="text-align:center; padding:20px;">
+    <div class="loader"></div>
+    <p style="color:#666;">正在匹配岗位，请稍候...</p>
+</div>
+<style>
+.loader {
+    border: 5px solid #f3f3f3;
+    border-radius: 50%;
+    border-top: 5px solid #3498db;
+    width: 50px;
+    height: 50px;
+    animation: spin 1s linear infinite;
+    margin: 0 auto;
+}
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+</style>
+""", visible=False)
+
+optimize_progress = gr.HTML("""
+<div style="text-align:center; padding:20px;">
+    <div class="loader"></div>
+    <p style="color:#666;">正在生成优化建议，请稍候...</p>
+</div>
+<style>
+.loader {
+    border: 5px solid #f3f3f3;
+    border-radius: 50%;
+    border-top: 5px solid #27ae60;
+    width: 50px;
+    height: 50px;
+    animation: spin 1s linear infinite;
+    margin: 0 auto;
+}
+</style>
+""", visible=False)
 # 初始化数据
 fetch_data()
 # 启动应用
